@@ -186826,8 +186826,26 @@ async function expectedPasswordHash(env) {
   return again?.value ?? hash;
 }
 __name(expectedPasswordHash, "expectedPasswordHash");
+var SESSION_VERSION_KEY = "auth.session_version";
+async function sessionVersion(env) {
+  const row = await env.DB.prepare("SELECT value FROM sys_cfg WHERE key = ?").bind(SESSION_VERSION_KEY).first();
+  if (row?.value) return row.value;
+  const value = randomId("s");
+  await env.DB.prepare("INSERT OR IGNORE INTO sys_cfg (key, value, updated_at) VALUES (?, ?, ?)").bind(SESSION_VERSION_KEY, value, nowIso2()).run();
+  const again = await env.DB.prepare("SELECT value FROM sys_cfg WHERE key = ?").bind(SESSION_VERSION_KEY).first();
+  return again?.value ?? value;
+}
+__name(sessionVersion, "sessionVersion");
+async function rotateSessionVersion(env) {
+  await env.DB.prepare(
+    `INSERT INTO sys_cfg (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).bind(SESSION_VERSION_KEY, randomId("s"), nowIso2()).run();
+}
+__name(rotateSessionVersion, "rotateSessionVersion");
 async function authVersion(env) {
-  return (await expectedPasswordHash(env)).slice(0, 32);
+  const pwd = (await expectedPasswordHash(env)).slice(0, 32);
+  return `${pwd}.${await sessionVersion(env)}`;
 }
 __name(authVersion, "authVersion");
 function nowIso2() {
@@ -186951,6 +186969,7 @@ app.post("/api/login", async (c) => {
       return Response.json({ error: "\u52A8\u6001\u9A8C\u8BC1\u7801\u9519\u8BEF", needCode: true }, { status: 401 });
     }
   }
+  await rotateSessionVersion(c.env);
   await notifyLogin(c.env, { ip, account: "admin", ok: true });
   return c.json({ token: await issueToken(await authSecret(c.env), await authVersion(c.env)) });
 });
@@ -186996,6 +187015,7 @@ app.post("/api/google/login", async (c) => {
     await c.env.DB.prepare(
       `DELETE FROM sys_cfg WHERE key LIKE 'google.used:%' AND CAST(value AS INTEGER) * 1000 + 3600000 < ?`
     ).bind(Date.now()).run();
+    await rotateSessionVersion(c.env);
     await notifyLogin(c.env, { ip, account: payload.email, ok: true });
     return c.json({ token: await issueToken(await authSecret(c.env), await authVersion(c.env)) });
   } catch (e) {
