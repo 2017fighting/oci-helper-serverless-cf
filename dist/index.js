@@ -183837,28 +183837,60 @@ function fromBase64Url(str) {
   return fromBase64(b64.padEnd(Math.ceil(b64.length / 4) * 4, "="));
 }
 __name(fromBase64Url, "fromBase64Url");
-async function aesKey(secret) {
+async function aesKey(secret, salt) {
+  const material = await crypto.subtle.importKey("raw", enc.encode(secret), "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt, info: enc.encode("oci-helper-serverless:enc:v2:aes-gcm") },
+    material,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+__name(aesKey, "aesKey");
+async function aesKeyLegacy(secret) {
   const digest = await crypto.subtle.digest("SHA-256", enc.encode(`oci-helper-serverless:${secret}`));
   return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
-__name(aesKey, "aesKey");
+__name(aesKeyLegacy, "aesKeyLegacy");
 async function encryptText(secret, plain) {
-  const key = await aesKey(secret);
+  if (!secret) throw new Error("\u7F3A\u5C11\u52A0\u5BC6\u5BC6\u94A5 KEY_SECRET");
+  const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await aesKey(secret, salt);
   const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plain));
-  return `${toBase64(iv)}.${toBase64(new Uint8Array(cipher))}`;
+  return `v2.${toBase64(salt)}.${toBase64(iv)}.${toBase64(new Uint8Array(cipher))}`;
 }
 __name(encryptText, "encryptText");
 async function decryptText(secret, packed) {
-  const [ivPart, dataPart] = packed.split(".");
-  if (!ivPart || !dataPart) throw new Error("\u5BC6\u6587\u683C\u5F0F\u4E0D\u6B63\u786E");
-  const key = await aesKey(secret);
-  const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: fromBase64(ivPart) },
-    key,
-    fromBase64(dataPart)
-  );
-  return dec.decode(plain);
+  const candidates = (Array.isArray(secret) ? secret : [secret]).filter(Boolean);
+  if (!candidates.length) throw new Error("\u7F3A\u5C11\u52A0\u5BC6\u5BC6\u94A5 KEY_SECRET");
+  const parts = (packed || "").split(".");
+  if (parts[0] === "v2" && parts.length === 4) {
+    const key = await aesKey(candidates[0], fromBase64(parts[1]));
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: fromBase64(parts[2]) },
+      key,
+      fromBase64(parts[3])
+    );
+    return dec.decode(plain);
+  }
+  if (parts.length === 2) {
+    for (const candidate of candidates) {
+      try {
+        const key = await aesKeyLegacy(candidate);
+        const plain = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: fromBase64(parts[0]) },
+          key,
+          fromBase64(parts[1])
+        );
+        return dec.decode(plain);
+      } catch {
+      }
+    }
+    throw new Error("\u65E7\u5BC6\u6587\u89E3\u5BC6\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u5F55\u5165\u654F\u611F\u914D\u7F6E\u6216\u786E\u8BA4 KEY_SECRET \u672A\u53D8\u66F4");
+  }
+  throw new Error("\u5BC6\u6587\u683C\u5F0F\u4E0D\u6B63\u786E");
 }
 __name(decryptText, "decryptText");
 async function hmacKey(secret) {
@@ -183869,14 +183901,22 @@ async function hmacKey(secret) {
 }
 __name(hmacKey, "hmacKey");
 var TOKEN_TTL_SECONDS = 3 * 60 * 60;
-async function issueToken(secret, ttlSeconds = TOKEN_TTL_SECONDS) {
-  const payload = toBase64Url(enc.encode(JSON.stringify({ exp: Date.now() + ttlSeconds * 1e3 })));
+async function issueToken(secret, version = "", ttlSeconds = TOKEN_TTL_SECONDS) {
+  const payload = toBase64Url(
+    enc.encode(
+      JSON.stringify({
+        exp: Date.now() + ttlSeconds * 1e3,
+        jti: crypto.randomUUID(),
+        ver: version
+      })
+    )
+  );
   const key = await hmacKey(secret);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(payload));
   return `${payload}.${toBase64Url(new Uint8Array(sig))}`;
 }
 __name(issueToken, "issueToken");
-async function verifyToken(secret, token) {
+async function verifyToken(secret, token, version = "") {
   if (!token || typeof token !== "string") return false;
   const t = token.trim();
   if (!t || t.length > 4096) return false;
@@ -183884,18 +183924,34 @@ async function verifyToken(secret, token) {
   if (parts.length !== 2) return false;
   const [payload, sig] = parts;
   if (!payload || !sig) return false;
-  if (!secret) return false;
+  if (!secret || !version) return false;
   try {
     const key = await hmacKey(secret);
     const ok = await crypto.subtle.verify("HMAC", key, fromBase64Url(sig), enc.encode(payload));
     if (!ok) return false;
     const data = JSON.parse(dec.decode(fromBase64Url(payload)));
-    return typeof data.exp === "number" && data.exp > Date.now();
+    if (typeof data.exp !== "number" || data.exp <= Date.now()) return false;
+    if (typeof data.jti !== "string" || !data.jti) return false;
+    return typeof data.ver === "string" && data.ver === version;
   } catch {
     return false;
   }
 }
 __name(verifyToken, "verifyToken");
+function constantTimeEqual(a, b) {
+  const ea = enc.encode(a);
+  const eb = enc.encode(b);
+  if (ea.length !== eb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ea.length; i++) diff |= ea[i] ^ eb[i];
+  return diff === 0;
+}
+__name(constantTimeEqual, "constantTimeEqual");
+async function passwordHash(password) {
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(`auth.password.v1:${password}`));
+  return toBase64Url(new Uint8Array(digest));
+}
+__name(passwordHash, "passwordHash");
 function randomId(prefix) {
   const bytes = crypto.getRandomValues(new Uint8Array(8));
   return `${prefix}_${toBase64Url(bytes)}`;
@@ -183927,9 +183983,9 @@ function resolveRegion(regionId) {
 }
 __name(resolveRegion, "resolveRegion");
 function instanceDisplayName() {
-  const d = /* @__PURE__ */ new Date();
+  const d = new Date(Date.now() + 8 * 60 * 60 * 1e3);
   const p = /* @__PURE__ */ __name((n) => String(n).padStart(2, "0"), "p");
-  return `instance-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  return `instance-${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}`;
 }
 __name(instanceDisplayName, "instanceDisplayName");
 function createClients(cred) {
@@ -185377,62 +185433,6 @@ async function getCostAnalysis(c, p) {
 }
 __name(getCostAnalysis, "getCostAnalysis");
 
-// src/lib/ratelimit.ts
-var buckets = /* @__PURE__ */ new Map();
-var WINDOW_MS = 5 * 60 * 1e3;
-var MAX_FAILS = 10;
-var BLOCK_MS = 15 * 60 * 1e3;
-function prune(now) {
-  if (buckets.size < 1e3) return;
-  for (const [k, v] of buckets) {
-    if (now - v.since > WINDOW_MS && v.blockedUntil < now) buckets.delete(k);
-  }
-}
-__name(prune, "prune");
-function checkLoginRate(ip) {
-  const now = Date.now();
-  const key = ip || "unknown";
-  let b = buckets.get(key);
-  if (!b) {
-    b = { count: 0, since: now, blockedUntil: 0 };
-    buckets.set(key, b);
-  }
-  if (b.blockedUntil > now) {
-    return { ok: false, retryAfter: Math.ceil((b.blockedUntil - now) / 1e3) };
-  }
-  if (now - b.since > WINDOW_MS) {
-    b.since = now;
-    b.count = 0;
-  }
-  return { ok: true };
-}
-__name(checkLoginRate, "checkLoginRate");
-function recordLoginFail(ip) {
-  const now = Date.now();
-  const key = ip || "unknown";
-  let b = buckets.get(key);
-  if (!b) {
-    b = { count: 0, since: now, blockedUntil: 0 };
-    buckets.set(key, b);
-  }
-  if (now - b.since > WINDOW_MS) {
-    b.since = now;
-    b.count = 0;
-  }
-  b.count += 1;
-  if (b.count >= MAX_FAILS) {
-    b.blockedUntil = now + BLOCK_MS;
-    b.count = 0;
-    b.since = now;
-  }
-  prune(now);
-}
-__name(recordLoginFail, "recordLoginFail");
-function clearLoginFails(ip) {
-  buckets.delete(ip || "unknown");
-}
-__name(clearLoginFails, "clearLoginFails");
-
 // src/lib/bootstrap.ts
 var initialized = false;
 async function ensureSchema(env) {
@@ -185889,16 +185889,21 @@ var SYS_DEFS = [
   { key: "dns.cf_token", label: "Cloudflare API Token", secret: true }
 ];
 function keySecret(env) {
-  return env.KEY_SECRET ?? env.AUTH_SECRET ?? "dev-insecure-key";
+  if (!env.KEY_SECRET) throw new Error("\u670D\u52A1\u7AEF\u672A\u914D\u7F6E KEY_SECRET\uFF0C\u62D2\u7EDD\u52A0\u5BC6/\u89E3\u5BC6\u654F\u611F\u6570\u636E");
+  return env.KEY_SECRET;
 }
 __name(keySecret, "keySecret");
+function keySecretsForRead(env) {
+  return [env.KEY_SECRET, env.AUTH_SECRET, "dev-insecure-key"].filter(Boolean);
+}
+__name(keySecretsForRead, "keySecretsForRead");
 async function sysGet(env, key) {
   const row = await env.DB.prepare("SELECT value FROM sys_cfg WHERE key = ?").bind(key).first();
   if (!row?.value) return null;
   const def = SYS_DEFS.find((d) => d.key === key);
   if (def?.secret) {
     try {
-      return await decryptText(keySecret(env), row.value);
+      return await decryptText(keySecretsForRead(env), row.value);
     } catch {
       return null;
     }
@@ -186045,14 +186050,18 @@ function archOf(shape) {
   return "amd";
 }
 __name(archOf, "archOf");
+function fmtParts() {
+  const d = new Date(Date.now() + 8 * 60 * 60 * 1e3);
+  const p = /* @__PURE__ */ __name((n) => String(n).padStart(2, "0"), "p");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+__name(fmtParts, "fmtParts");
 function fmtNow() {
-  return (/* @__PURE__ */ new Date()).toLocaleString("zh-CN", { hour12: false });
+  return fmtParts();
 }
 __name(fmtNow, "fmtNow");
 function fmtChannelNow() {
-  const d = /* @__PURE__ */ new Date();
-  const p = /* @__PURE__ */ __name((n) => String(n).padStart(2, "0"), "p");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return fmtParts();
 }
 __name(fmtChannelNow, "fmtChannelNow");
 function elapsedSince(start) {
@@ -186409,7 +186418,7 @@ async function getCfg(env, id) {
 }
 __name(getCfg, "getCfg");
 async function buildClientsFromCfg(env, cfg, region, compartmentId) {
-  const secret = env.KEY_SECRET ?? env.AUTH_SECRET ?? "dev-insecure-key";
+  const secret = keySecretsForRead(env);
   const privateKey = await decryptText(secret, cfg.private_key_enc);
   const passphrase = cfg.passphrase_enc ? await decryptText(secret, cfg.passphrase_enc) : null;
   return createClients({
@@ -186473,7 +186482,18 @@ async function runTaskOnce(env, taskId) {
         await log("warn", `\u5B50\u7F51 ${subnet.name} \u7981\u6B62\u516C\u7F51\u5165\u53E3\uFF0C\u5B9E\u4F8B\u5C06\u6CA1\u6709\u516C\u7F51 IP`);
       }
       if (subnetIpv6) await log("info", `\u5B50\u7F51\u5DF2\u5F00\u542F IPv6\uFF08${subnetIpv6}\uFF09\uFF0C\u5B9E\u4F8B\u4F1A\u5206\u914D IPv6 \u5730\u5740`);
-      const userData = buildCloudInit(task.root_password);
+      let rootPassword = "";
+      if (task.root_password) {
+        try {
+          rootPassword = await decryptText(keySecretsForRead(env), task.root_password);
+        } catch {
+          if (task.root_password.startsWith("v2.")) {
+            throw new Error("root \u5BC6\u7801\u89E3\u5BC6\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5 KEY_SECRET \u662F\u5426\u53D8\u66F4");
+          }
+          rootPassword = task.root_password;
+        }
+      }
+      const userData = buildCloudInit(rootPassword);
       const sshKey = (task.ssh_public_key ?? "").trim();
       await log(
         "info",
@@ -186488,7 +186508,7 @@ async function runTaskOnce(env, taskId) {
           try {
             await log(
               "info",
-              `\u521B\u5EFA\u53C2\u6570\uFF08${ad}\uFF09\uFF1A\u914D\u7F6E=${cfg.name} shape=${task.shape} ocpus=${task.ocpus} memory=${task.memory_gb}GB boot=${task.boot_volume_gb}GB image=${image.id} subnet=${subnetId} rootPassword=${task.root_password ? "\u5DF2\u8BBE\u7F6E" : "\u65E0"} sshKey=${sshKey ? "\u5DF2\u8BBE\u7F6E" : "\u65E0"} userData=${userData ? "\u5DF2\u8BBE\u7F6E" : "\u65E0"} ipv6=${subnetIpv6 || "\u65E0"}`
+              `\u521B\u5EFA\u53C2\u6570\uFF08${ad}\uFF09\uFF1A\u914D\u7F6E=${cfg.name} shape=${task.shape} ocpus=${task.ocpus} memory=${task.memory_gb}GB boot=${task.boot_volume_gb}GB image=${image.id} subnet=${subnetId} rootPassword=${rootPassword ? "\u5DF2\u8BBE\u7F6E" : "\u65E0"} sshKey=${sshKey ? "\u5DF2\u8BBE\u7F6E" : "\u65E0"} userData=${userData ? "\u5DF2\u8BBE\u7F6E" : "\u65E0"} ipv6=${subnetIpv6 || "\u65E0"}`
             );
             const displayName = instanceDisplayName();
             const resp = await launchInstance(clients, {
@@ -186501,7 +186521,7 @@ async function runTaskOnce(env, taskId) {
               imageId: image.id,
               subnetId,
               ipv6SubnetCidr: subnetIpv6 || void 0,
-              rootPassword: task.root_password,
+              rootPassword,
               sshPublicKey: sshKey || void 0,
               userDataBase64: userData ? toBase64Utf8(userData) : void 0
             });
@@ -186731,6 +186751,7 @@ var LogHub = class {
       return new Response("ok");
     }
     if ((request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
+      const protocol = (request.headers.get("Sec-WebSocket-Protocol") ?? "").split(",")[0]?.trim() ?? "";
       const pair = new WebSocketPair();
       const client = pair[0];
       const server = pair[1];
@@ -186745,7 +186766,11 @@ var LogHub = class {
       );
       server.addEventListener("close", () => this.sessions.delete(server));
       server.addEventListener("error", () => this.sessions.delete(server));
-      return new Response(null, { status: 101, webSocket: client });
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+        headers: protocol ? { "Sec-WebSocket-Protocol": protocol } : void 0
+      });
     }
     return new Response("not found", { status: 404 });
   }
@@ -186768,12 +186793,16 @@ installOciFetchTracer();
 var app = new Hono3();
 app.use("/api/*", async (c, next) => {
   await ensureSchema(c.env);
+  if (!c.env.KEY_SECRET && c.req.path !== "/api/health") {
+    return Response.json(
+      { error: "\u670D\u52A1\u7AEF\u672A\u914D\u7F6E KEY_SECRET\uFF0C\u8BF7\u5148\u5728 Cloudflare \u73AF\u5883\u53D8\u91CF\u4E2D\u8BBE\u7F6E\u5E76\u91CD\u65B0\u90E8\u7F72" },
+      { status: 503 }
+    );
+  }
   await next();
 });
-var DEFAULT_PASSWORD = "admin123";
 async function authSecret(env) {
   if (env.AUTH_SECRET) return env.AUTH_SECRET;
-  if (env.KEY_SECRET) return env.KEY_SECRET;
   const KEY = "auth.token_secret";
   const row = await env.DB.prepare("SELECT value FROM sys_cfg WHERE key = ?").bind(KEY).first();
   if (row?.value) return row.value;
@@ -186784,10 +186813,23 @@ async function authSecret(env) {
   return again?.value ?? secret;
 }
 __name(authSecret, "authSecret");
-function keySecret2(env) {
-  return env.KEY_SECRET ?? env.AUTH_SECRET ?? "dev-insecure-key";
+async function expectedPasswordHash(env) {
+  if (env.AUTH_PASSWORD) return passwordHash(env.AUTH_PASSWORD);
+  const KEY = "auth.password_hash";
+  const row = await env.DB.prepare("SELECT value FROM sys_cfg WHERE key = ?").bind(KEY).first();
+  if (row?.value) return row.value;
+  const generated = randomPassword(24);
+  const hash = await passwordHash(generated);
+  await env.DB.prepare("INSERT OR IGNORE INTO sys_cfg (key, value, updated_at) VALUES (?, ?, ?)").bind(KEY, hash, nowIso2()).run();
+  console.log(`[AUTH] \u672A\u8BBE\u7F6E AUTH_PASSWORD\uFF0C\u5DF2\u751F\u6210\u968F\u673A\u521D\u59CB\u5BC6\u7801\uFF1A${generated}\uFF08\u8BF7\u5C3D\u5FEB\u8BBE\u7F6E AUTH_PASSWORD \u73AF\u5883\u53D8\u91CF\uFF09`);
+  const again = await env.DB.prepare("SELECT value FROM sys_cfg WHERE key = ?").bind(KEY).first();
+  return again?.value ?? hash;
 }
-__name(keySecret2, "keySecret");
+__name(expectedPasswordHash, "expectedPasswordHash");
+async function authVersion(env) {
+  return (await expectedPasswordHash(env)).slice(0, 32);
+}
+__name(authVersion, "authVersion");
 function nowIso2() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
@@ -186849,8 +186891,8 @@ async function getCfg2(env, id) {
 }
 __name(getCfg2, "getCfg");
 async function clientsFor(env, row, region, compartmentId) {
-  const privateKey = await decryptText(keySecret2(env), row.private_key_enc);
-  const passphrase = row.passphrase_enc ? await decryptText(keySecret2(env), row.passphrase_enc) : null;
+  const privateKey = await decryptText(keySecretsForRead(env), row.private_key_enc);
+  const passphrase = row.passphrase_enc ? await decryptText(keySecretsForRead(env), row.passphrase_enc) : null;
   return createClients({
     tenancyOcid: row.tenancy_ocid,
     userOcid: row.user_ocid,
@@ -186887,16 +186929,9 @@ __name(clientIp, "clientIp");
 app.post("/api/login", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const ip = clientIp(c);
-  const rate = checkLoginRate(ip);
-  if (!rate.ok) {
-    return Response.json(
-      { error: `\u767B\u5F55\u5931\u8D25\u6B21\u6570\u8FC7\u591A\uFF0C\u8BF7 ${Math.ceil((rate.retryAfter ?? 900) / 60)} \u5206\u949F\u540E\u518D\u8BD5` },
-      { status: 429, headers: { "Retry-After": String(rate.retryAfter ?? 900) } }
-    );
-  }
-  const expected = c.env.AUTH_PASSWORD ?? DEFAULT_PASSWORD;
-  if (!body.password || body.password !== expected) {
-    recordLoginFail(ip);
+  const expected = await expectedPasswordHash(c.env);
+  const provided = typeof body.password === "string" ? await passwordHash(body.password) : "";
+  if (!body.password || !constantTimeEqual(provided, expected)) {
     await notifyLogin(c.env, { ip, account: "admin", ok: false, reason: "\u5BC6\u7801\u9519\u8BEF" });
     return Response.json({ error: "\u5BC6\u7801\u9519\u8BEF" }, { status: 401 });
   }
@@ -186908,29 +186943,18 @@ app.post("/api/login", async (c) => {
       return Response.json({ error: "\u4E8C\u6B21\u9A8C\u8BC1\u914D\u7F6E\u5F02\u5E38\uFF08\u5BC6\u94A5\u4E22\u5931\uFF09\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458", needCode: false }, { status: 503 });
     }
     if (!body.code) {
-      recordLoginFail(ip);
       await notifyLogin(c.env, { ip, account: "admin", ok: false, reason: "MFA\u9A8C\u8BC1\u7801\u4E3A\u7A7A" });
       return Response.json({ error: "\u8BF7\u8F93\u5165\u52A8\u6001\u9A8C\u8BC1\u7801", needCode: true }, { status: 401 });
     }
     if (!await verifyTotp(secret, body.code)) {
-      recordLoginFail(ip);
       await notifyLogin(c.env, { ip, account: "admin", ok: false, reason: "MFA\u9A8C\u8BC1\u7801\u9519\u8BEF" });
       return Response.json({ error: "\u52A8\u6001\u9A8C\u8BC1\u7801\u9519\u8BEF", needCode: true }, { status: 401 });
     }
   }
-  clearLoginFails(ip);
   await notifyLogin(c.env, { ip, account: "admin", ok: true });
-  return c.json({ token: await issueToken(await authSecret(c.env)) });
+  return c.json({ token: await issueToken(await authSecret(c.env), await authVersion(c.env)) });
 });
-app.get("/api/health", async (c) => {
-  const mfaEnabled = await sysGet(c.env, "mfa.enabled").catch(() => null) === "1";
-  return c.json({
-    ok: true,
-    defaultPassword: !c.env.AUTH_PASSWORD,
-    keySecretMissing: !c.env.KEY_SECRET,
-    mfaEnabled
-  });
-});
+app.get("/api/health", (c) => c.json({ ok: true }));
 app.get("/api/google/client-id", async (c) => {
   const enabled = await sysGet(c.env, "google.enabled") === "1";
   const clientId = (await sysGet(c.env, "google.client_id"))?.trim() || "";
@@ -186941,13 +186965,6 @@ app.post("/api/google/login", async (c) => {
   const credential = (body.credential ?? "").trim();
   if (!credential) return badRequest("\u7F3A\u5C11 Google \u51ED\u8BC1");
   const ip = clientIp(c);
-  const rate = checkLoginRate(ip);
-  if (!rate.ok) {
-    return Response.json(
-      { error: `\u5C1D\u8BD5\u6B21\u6570\u8FC7\u591A\uFF0C\u8BF7 ${Math.ceil((rate.retryAfter ?? 900) / 60)} \u5206\u949F\u540E\u518D\u8BD5` },
-      { status: 429, headers: { "Retry-After": String(rate.retryAfter ?? 900) } }
-    );
-  }
   const enabled = await sysGet(c.env, "google.enabled") === "1";
   const clientId = (await sysGet(c.env, "google.client_id"))?.trim() || "";
   if (!enabled || !clientId) {
@@ -186963,7 +186980,6 @@ app.post("/api/google/login", async (c) => {
       return badRequest("\u7CFB\u7EDF\u672A\u914D\u7F6E\u5141\u8BB8\u767B\u5F55\u7684 Google \u8D26\u53F7\u767D\u540D\u5355");
     }
     if (!list.includes(payload.email.toLowerCase())) {
-      recordLoginFail(ip);
       await notifyLogin(c.env, { ip, account: payload.email, ok: false, reason: "Google \u8D26\u53F7\u4E0D\u5728\u767D\u540D\u5355" });
       return badRequest(`Google \u8D26\u53F7 ${payload.email} \u4E0D\u5728\u5141\u8BB8\u767B\u5F55\u7684\u767D\u540D\u5355\u4E2D`);
     }
@@ -186973,7 +186989,6 @@ app.post("/api/google/login", async (c) => {
     const usedRow = await c.env.DB.prepare("SELECT value, updated_at FROM sys_cfg WHERE key = ?").bind(usedKey).first();
     const expireAt = Number(usedRow?.value ?? 0) * 1e3 + 36e5;
     if (usedRow && expireAt > Date.now()) {
-      recordLoginFail(ip);
       await notifyLogin(c.env, { ip, account: payload.email, ok: false, reason: "Google \u51ED\u8BC1\u5DF2\u88AB\u4F7F\u7528" });
       return Response.json({ error: "\u8BE5 Google \u51ED\u8BC1\u5DF2\u88AB\u4F7F\u7528\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55" }, { status: 401 });
     }
@@ -186981,11 +186996,9 @@ app.post("/api/google/login", async (c) => {
     await c.env.DB.prepare(
       `DELETE FROM sys_cfg WHERE key LIKE 'google.used:%' AND CAST(value AS INTEGER) * 1000 + 3600000 < ?`
     ).bind(Date.now()).run();
-    clearLoginFails(ip);
     await notifyLogin(c.env, { ip, account: payload.email, ok: true });
-    return c.json({ token: await issueToken(await authSecret(c.env)) });
+    return c.json({ token: await issueToken(await authSecret(c.env), await authVersion(c.env)) });
   } catch (e) {
-    recordLoginFail(ip);
     await notifyLogin(c.env, { ip, account: "google", ok: false, reason: e?.message || "Google \u51ED\u8BC1\u6821\u9A8C\u5931\u8D25" });
     return Response.json({ error: errorMessage(e) }, { status: 401 });
   }
@@ -187005,8 +187018,10 @@ app.use("/api/*", async (c, next) => {
   if (PUBLIC_API_PATHS.has(path)) return next();
   const header = c.req.header("authorization") ?? "";
   let token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-  if (!token && path === "/api/logs/stream") token = c.req.query("token") ?? "";
-  if (!token || !await verifyToken(await authSecret(c.env), token)) {
+  if (!token && path === "/api/logs/stream") {
+    token = (c.req.header("sec-websocket-protocol") ?? "").split(",")[0]?.trim() ?? "";
+  }
+  if (!token || !await verifyToken(await authSecret(c.env), token, await authVersion(c.env))) {
     return Response.json({ error: "\u672A\u767B\u5F55\u6216\u767B\u5F55\u5DF2\u8FC7\u671F" }, { status: 401 });
   }
   await next();
@@ -187215,8 +187230,8 @@ app.post("/api/cfgs", async (c) => {
     body.fingerprint.trim(),
     body.region.trim(),
     body.compartmentId?.trim() || null,
-    await encryptText(keySecret2(c.env), body.privateKey.trim()),
-    body.passphrase ? await encryptText(keySecret2(c.env), body.passphrase) : null,
+    await encryptText(keySecret(c.env), body.privateKey.trim()),
+    body.passphrase ? await encryptText(keySecret(c.env), body.passphrase) : null,
     body.proxy?.trim() || null,
     status,
     lastError,
@@ -187270,11 +187285,11 @@ app.patch("/api/cfgs/:id", async (c) => {
   if (body.privateKey !== void 0) {
     if (!body.privateKey.includes("PRIVATE KEY")) return badRequest("\u79C1\u94A5\u683C\u5F0F\u4E0D\u6B63\u786E");
     sets.push("private_key_enc = ?");
-    values.push(await encryptText(keySecret2(c.env), body.privateKey.trim()));
+    values.push(await encryptText(keySecret(c.env), body.privateKey.trim()));
   }
   if (body.passphrase !== void 0) {
     sets.push("passphrase_enc = ?");
-    values.push(body.passphrase ? await encryptText(keySecret2(c.env), body.passphrase) : null);
+    values.push(body.passphrase ? await encryptText(keySecret(c.env), body.passphrase) : null);
   }
   if (!sets.length) return c.json({ ok: true });
   sets.push("updated_at = ?");
@@ -188266,7 +188281,9 @@ function publicTask(row) {
     osVersion: row.os_version,
     imageId: row.image_id,
     subnetId: row.subnet_id,
-    rootPassword: row.root_password,
+    // 不回显 root 密码明文；仅告知是否已配置，编辑时留空即保持不变
+    rootPassword: "",
+    hasRootPassword: !!row.root_password,
     sshPublicKey: row.ssh_public_key ?? "",
     targetCount: row.target_count,
     successCount: row.success_count,
@@ -188328,6 +188345,7 @@ app.post("/api/tasks", async (c) => {
   const sshPublicKey = (body.sshPublicKey ?? "").trim();
   const loginError = validateLogin(rootPassword, sshPublicKey);
   if (loginError) return badRequest(loginError);
+  const rootPasswordEnc = rootPassword ? await encryptText(keySecret(c.env), rootPassword) : null;
   const shape = shapeOf(body.shape ?? "ARM");
   const os = osFilter(body.osName);
   const id = randomId("task");
@@ -188352,7 +188370,7 @@ app.post("/api/tasks", async (c) => {
     os.operatingSystemVersion,
     body.imageId?.trim() || null,
     body.subnetId?.trim() || null,
-    rootPassword || null,
+    rootPasswordEnc,
     sshPublicKey || null,
     target,
     interval,
@@ -188395,14 +188413,15 @@ app.patch("/api/tasks/:id", async (c) => {
     values.push(Math.min(Math.max(Number(body.intervalSec), 30), 3600));
   }
   if (body.rootPassword !== void 0) {
+    const pwd = body.rootPassword.trim();
     sets.push("root_password = ?");
-    values.push(body.rootPassword.trim() || null);
+    values.push(pwd ? await encryptText(keySecret(c.env), pwd) : null);
   }
   if (body.sshPublicKey !== void 0) {
     sets.push("ssh_public_key = ?");
     values.push(body.sshPublicKey.trim() || null);
   }
-  const nextPassword = body.rootPassword !== void 0 ? body.rootPassword.trim() : task.root_password ?? "";
+  const nextPassword = body.rootPassword !== void 0 ? body.rootPassword.trim() : task.root_password ? "__existing__" : "";
   const nextKey = body.sshPublicKey !== void 0 ? body.sshPublicKey.trim() : task.ssh_public_key ?? "";
   const loginError = validateLogin(nextPassword, nextKey);
   if (loginError) return badRequest(loginError);
